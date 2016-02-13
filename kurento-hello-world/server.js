@@ -23,6 +23,7 @@ var ws = require('ws');
 var kurento = require('kurento-client');
 var fs    = require('fs');
 var https = require('https');
+var Q = require('q');
 
 var argv = minimist(process.argv.slice(2), {
     default: {
@@ -75,6 +76,142 @@ var wss = new ws.Server({
     path : '/helloworld'
 });
 
+
+var onIceCandidate = function (sessionId, _candidate) {
+    var candidate = kurento.register.complexTypes.IceCandidate(_candidate);
+
+    if (sessions[sessionId]) {
+        console.info('Sending candidate');
+        var webRtcEndpoint = sessions[sessionId].webRtcEndpoint;
+        webRtcEndpoint.addIceCandidate(candidate);
+    }
+    else {
+        console.info('Queueing candidate');
+        if (!candidatesQueue[sessionId]) {
+            candidatesQueue[sessionId] = [];
+        }
+        candidatesQueue[sessionId].push(candidate);
+    }
+},
+getKurentoClient = function(callback) {
+    var deferer = Q.defer();
+    if (kurentoClient !== null) {
+        Q.timeout()
+            .then(function(){
+                deferer.resolve({kurentoClient : kurentoClient});
+            });
+    }
+
+    kurento(argv.ws_uri, function(error, _kurentoClient) {
+        var msg;
+        if (error) {
+            msg = "Could not find media server at address" + argv.ws_uri
+                    + ". Exiting with error " + error;
+            deferer.reject(msg);
+        } else {
+            kurentoClient = _kurentoClient;
+            deferer.resolve({kurentoClient : kurentoClient});
+        }
+    });
+    return deferer.promise;
+},
+start = function(sessionId, ws, sdpOffer) {
+    return getKurentoClient()
+        .then(function(docs) {
+            var deferer = Q.defer();
+            docs.kurentoClient.create('MediaPipeline', function(error, pipeline) {
+                if (error) {
+                    deferer.reject(error);
+                } else {
+                    docs.pipeline = pipeline
+                    deferer.resolve(docs);
+                }
+            });
+            return deferer.promise;
+        })
+        .then(function(docs){
+            var deferer = Q.defer();
+            docs.pipeline.create('WebRtcEndpoint', function(error, webRtcEndpoint) {
+                if (error) {
+                    deferer.reject(error, docs);
+                } else {
+                    docs.webRtcEndpoint = webRtcEndpoint;
+                    deferer.resolve(docs);
+                }
+            });
+            return deferer.promise;
+        })
+        .then(function(docs){
+            var deferer = Q.defer();
+
+            if (candidatesQueue[sessionId]) {
+                while(candidatesQueue[sessionId].length) {
+                    var candidate = candidatesQueue[sessionId].shift();
+                    docs.webRtcEndpoint.addIceCandidate(candidate);
+                }
+            }
+
+            docs.webRtcEndpoint.connect(docs.webRtcEndpoint, function(error) {
+                if (error) {
+                    deferer.reject(error);
+                } else {
+                    deferer.resolve(docs);
+                }
+            });
+            return deferer.promise;
+        })
+        .then(function(docs){
+            var webRtcEndpoint = docs.webRtcEndpoint;
+            var deferer = Q.defer();
+
+            webRtcEndpoint.on('OnIceCandidate', function(event) {
+                var candidate = kurento.register.complexTypes.IceCandidate(event.candidate);
+                ws.send(JSON.stringify({
+                    id : 'iceCandidate',
+                    candidate : candidate
+                }));
+            });
+
+            webRtcEndpoint.processOffer(sdpOffer, function(error, sdpAnswer) {
+                if (error) {
+                    deferer.reject(error, docs);
+                } else {
+                    sessions[sessionId] = {
+                        'pipeline' : docs.pipeline,
+                        'webRtcEndpoint' : docs.webRtcEndpoint
+                    }
+                    docs.sdpAnswer = sdpAnswer;
+                    deferer.resolve(docs);
+                }
+            });
+
+            webRtcEndpoint.gatherCandidates(function(error) {
+                if (error) {
+                    deferer.reject(error);
+                }
+            });
+
+            return deferer.promise;
+        })
+        .catch(function(err, docs){
+            if(docs && docs.pipeline) {
+                docs.pipeline.release();
+            }
+            console.log(err);
+        });
+},
+stop = function(sessionId) {
+    if (sessions[sessionId]) {
+        var pipeline = sessions[sessionId].pipeline;
+        console.info('Releasing pipeline');
+        pipeline.release();
+
+        delete sessions[sessionId];
+        delete candidatesQueue[sessionId];
+    }
+};
+
+
 /*
  * Management of WebSocket messages
  */
@@ -107,18 +244,24 @@ wss.on('connection', function(ws) {
         switch (message.id) {
         case 'start':
             sessionId = request.session.id;
-            start(sessionId, ws, message.sdpOffer, function(error, sdpAnswer) {
-                if (error) {
-                    return ws.send(JSON.stringify({
+
+            if (!sessionId) {
+                console.log('Cannot use undefined sessionId');
+            }
+
+            start(sessionId, ws, message.sdpOffer)
+                .then(function(docs){
+                    ws.send(JSON.stringify({
+                        id : 'startResponse',
+                        sdpAnswer : docs.sdpAnswer
+                    }));
+                })
+                .catch(function(err){
+                    ws.send(JSON.stringify({
                         id : 'error',
                         message : error
                     }));
-                }
-                ws.send(JSON.stringify({
-                    id : 'startResponse',
-                    sdpAnswer : sdpAnswer
-                }));
-            });
+                });
             break;
 
         case 'stop':
@@ -139,140 +282,5 @@ wss.on('connection', function(ws) {
 
     });
 });
-
-/*
- * Definition of functions
- */
-
-// Recover kurentoClient for the first time.
-function getKurentoClient(callback) {
-    if (kurentoClient !== null) {
-        return callback(null, kurentoClient);
-    }
-
-    kurento(argv.ws_uri, function(error, _kurentoClient) {
-        if (error) {
-            console.log("Could not find media server at address " + argv.ws_uri);
-            return callback("Could not find media server at address" + argv.ws_uri
-                    + ". Exiting with error " + error);
-        }
-
-        kurentoClient = _kurentoClient;
-        callback(null, kurentoClient);
-    });
-}
-
-function start(sessionId, ws, sdpOffer, callback) {
-    if (!sessionId) {
-        return callback('Cannot use undefined sessionId');
-    }
-
-    getKurentoClient(function(error, kurentoClient) {
-        if (error) {
-            return callback(error);
-        }
-
-        kurentoClient.create('MediaPipeline', function(error, pipeline) {
-            if (error) {
-                return callback(error);
-            }
-
-            createMediaElements(pipeline, ws, function(error, webRtcEndpoint) {
-                if (error) {
-                    pipeline.release();
-                    return callback(error);
-                }
-
-                if (candidatesQueue[sessionId]) {
-                    while(candidatesQueue[sessionId].length) {
-                        var candidate = candidatesQueue[sessionId].shift();
-                        webRtcEndpoint.addIceCandidate(candidate);
-                    }
-                }
-
-                connectMediaElements(webRtcEndpoint, function(error) {
-                    if (error) {
-                        pipeline.release();
-                        return callback(error);
-                    }
-
-                    webRtcEndpoint.on('OnIceCandidate', function(event) {
-                        var candidate = kurento.register.complexTypes.IceCandidate(event.candidate);
-                        ws.send(JSON.stringify({
-                            id : 'iceCandidate',
-                            candidate : candidate
-                        }));
-                    });
-
-                    webRtcEndpoint.processOffer(sdpOffer, function(error, sdpAnswer) {
-                        if (error) {
-                            pipeline.release();
-                            return callback(error);
-                        }
-
-                        sessions[sessionId] = {
-                            'pipeline' : pipeline,
-                            'webRtcEndpoint' : webRtcEndpoint
-                        }
-                        return callback(null, sdpAnswer);
-                    });
-
-                    webRtcEndpoint.gatherCandidates(function(error) {
-                        if (error) {
-                            return callback(error);
-                        }
-                    });
-                });
-            });
-        });
-    });
-}
-
-function createMediaElements(pipeline, ws, callback) {
-    pipeline.create('WebRtcEndpoint', function(error, webRtcEndpoint) {
-        if (error) {
-            return callback(error);
-        }
-
-        return callback(null, webRtcEndpoint);
-    });
-}
-
-function connectMediaElements(webRtcEndpoint, callback) {
-    webRtcEndpoint.connect(webRtcEndpoint, function(error) {
-        if (error) {
-            return callback(error);
-        }
-        return callback(null);
-    });
-}
-
-function stop(sessionId) {
-    if (sessions[sessionId]) {
-        var pipeline = sessions[sessionId].pipeline;
-        console.info('Releasing pipeline');
-        pipeline.release();
-
-        delete sessions[sessionId];
-        delete candidatesQueue[sessionId];
-    }
-}
-
-function onIceCandidate(sessionId, _candidate) {
-    var candidate = kurento.register.complexTypes.IceCandidate(_candidate);
-
-    if (sessions[sessionId]) {
-        console.info('Sending candidate');
-        var webRtcEndpoint = sessions[sessionId].webRtcEndpoint;
-        webRtcEndpoint.addIceCandidate(candidate);
-    }
-    else {
-        console.info('Queueing candidate');
-        if (!candidatesQueue[sessionId]) {
-            candidatesQueue[sessionId] = [];
-        }
-        candidatesQueue[sessionId].push(candidate);
-    }
-}
 
 app.use(express.static(path.join(__dirname, 'static')));
