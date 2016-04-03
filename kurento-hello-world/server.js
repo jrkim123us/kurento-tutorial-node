@@ -23,7 +23,7 @@ var ws = require('ws');
 var kurento = require('kurento-client');
 var fs    = require('fs');
 var https = require('https');
-var Q = require('q');
+var $q = require('q');
 
 var argv = minimist(process.argv.slice(2), {
     default: {
@@ -53,7 +53,7 @@ var sessionHandler = session({
 });
 
 app.use(sessionHandler);
-
+app.use(express.static(path.join(__dirname, 'static')));
 /*
  * Definition of global variables.
  */
@@ -93,10 +93,10 @@ var onIceCandidate = function (sessionId, _candidate) {
         candidatesQueue[sessionId].push(candidate);
     }
 },
-getKurentoClient = function(callback) {
-    var deferer = Q.defer();
+makeClient = function() {
+    var deferer = $q.defer();
     if (kurentoClient !== null) {
-        Q.timeout()
+        $q.timeout()
             .then(function(){
                 deferer.resolve({kurentoClient : kurentoClient});
             });
@@ -116,9 +116,9 @@ getKurentoClient = function(callback) {
     return deferer.promise;
 },
 start = function(sessionId, ws, sdpOffer) {
-    return getKurentoClient()
+    return makeClient()
         .then(function(docs) {
-            var deferer = Q.defer();
+            var deferer = $q.defer();
             docs.kurentoClient.create('MediaPipeline', function(error, pipeline) {
                 if (error) {
                     deferer.reject(error);
@@ -130,7 +130,7 @@ start = function(sessionId, ws, sdpOffer) {
             return deferer.promise;
         })
         .then(function(docs){
-            var deferer = Q.defer();
+            var deferer = $q.defer();
             docs.pipeline.create('WebRtcEndpoint', function(error, webRtcEndpoint) {
                 if (error) {
                     deferer.reject(error, docs);
@@ -142,27 +142,8 @@ start = function(sessionId, ws, sdpOffer) {
             return deferer.promise;
         })
         .then(function(docs){
-            var deferer = Q.defer();
-
-            if (candidatesQueue[sessionId]) {
-                while(candidatesQueue[sessionId].length) {
-                    var candidate = candidatesQueue[sessionId].shift();
-                    docs.webRtcEndpoint.addIceCandidate(candidate);
-                }
-            }
-
-            docs.webRtcEndpoint.connect(docs.webRtcEndpoint, function(error) {
-                if (error) {
-                    deferer.reject(error);
-                } else {
-                    deferer.resolve(docs);
-                }
-            });
-            return deferer.promise;
-        })
-        .then(function(docs){
             var webRtcEndpoint = docs.webRtcEndpoint;
-            var deferer = Q.defer();
+            var deferer = $q.defer();
 
             webRtcEndpoint.on('OnIceCandidate', function(event) {
                 var candidate = kurento.register.complexTypes.IceCandidate(event.candidate);
@@ -193,12 +174,71 @@ start = function(sessionId, ws, sdpOffer) {
 
             return deferer.promise;
         })
+        .then(function(docs){
+            var deferer = $q.defer();
+
+            if (candidatesQueue[sessionId]) {
+                while(candidatesQueue[sessionId].length) {
+                    var candidate = candidatesQueue[sessionId].shift();
+                    docs.webRtcEndpoint.addIceCandidate(candidate);
+                }
+            }
+
+            docs.webRtcEndpoint.connect(docs.webRtcEndpoint, function(error) {
+                if (error) {
+                    deferer.reject(error);
+                } else {
+                    deferer.resolve(docs);
+                }
+            });
+            return deferer.promise;
+        })
+        .then(function(docs){
+            var deferer = $q.defer();
+            docs.pipeline.create('RtpEndpoint', function(err, rtpEndPoint){
+                if(err) {
+                    deferer.reject(err, docs);
+                } else {
+                    docs.rtpEndPoint = rtpEndPoint;
+                    deferer.resolve(docs);
+                }
+            });
+            return deferer.promise;
+        })
+        .then(function(docs){
+            var deferer = $q.defer();
+            var wowzaSdpOffer = '' +
+                'v=0\n' +
+                'o=- 0 0 IN IP4 192.168.0.2\n' +
+                's= \n' +
+                'c=IN IP4 192.168.0.2\n' +
+                't=0 0 \n' +
+                'm=video 15000 RTP/AVP 100 \n' +
+                'a=rtpmap:100 H264/90000\n' +
+                'a=recvonly\n';
+            docs.rtpEndPoint.processOffer(wowzaSdpOffer, function(err, sdpAnswer){
+                console.log('RtpEndPoint error \n' + err);
+                console.log('RtpEndPoint : \n' + sdpAnswer);
+            });
+
+            docs.webRtcEndpoint.connect(docs.rtpEndPoint, function(error) {
+                if (error) {
+                    console.log('rtpEndPoint err' + error);
+                    deferer.reject(error);
+                } else {
+                    deferer.resolve(docs);
+                }
+            });
+
+            return deferer.promise;
+        })
         .catch(function(err, docs){
             if(docs && docs.pipeline) {
                 docs.pipeline.release();
             }
             console.log(err);
         });
+
 },
 stop = function(sessionId) {
     if (sessions[sessionId]) {
@@ -239,7 +279,8 @@ wss.on('connection', function(ws) {
 
     ws.on('message', function(_message) {
         var message = JSON.parse(_message);
-        console.log('Connection ' + sessionId + ' received message ', message);
+        // console.log('Connection ' + sessionId + ' received message ', message);
+        console.log('Connection ' + sessionId + ' received message ');
 
         switch (message.id) {
         case 'start':
@@ -282,5 +323,3 @@ wss.on('connection', function(ws) {
 
     });
 });
-
-app.use(express.static(path.join(__dirname, 'static')));
